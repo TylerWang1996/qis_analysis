@@ -1,8 +1,22 @@
 import pandas as pd
 import numpy as np
-# Use explicit End offsets for clarity and future compatibility
 from pandas.tseries.offsets import BDay, MonthEnd, QuarterEnd, YearEnd, DateOffset
-from typing import Optional
+from typing import Optional, Union, Tuple # Added Union and Tuple for type hinting
+
+# Assuming backtester.py is in the same directory or accessible in PYTHONPATH
+# If not, you might need to adjust the import path
+try:
+    from backtester import Backtester
+except ImportError:
+    # This is a fallback for environments where backtester.py might not be directly importable
+    # In a real scenario, ensure your project structure and PYTHONPATH are set up correctly.
+    print("Warning: Could not import Backtester from backtester. Ensure it's accessible.")
+    # Define a dummy Backtester if needed for the code to be parsable,
+    # but it won't function correctly without the real one.
+    class Backtester:
+        def __init__(self, strategy_weights, substrategy_total_return_index, trading_days_per_year=252, months_per_year=12):
+            self.strategy_daily_returns = pd.Series(dtype=float) # Dummy
+            print("Dummy Backtester initialized. Real functionality requires actual backtester.py.")
 
 class EqualVolatilityPortfolio:
     """
@@ -396,3 +410,258 @@ class EqualVolatilityPortfolio:
         weights_df[row_sums == 0] = 0.0
 
         return weights_df
+
+class VolatilityTargetPortfolio:
+    """
+    Adjusts the leverage of a given base portfolio to target a specific
+    annualized volatility level, with an option to skip the most recent month.
+    """
+
+    def __init__(self,
+                 equal_vol_weights: pd.DataFrame,
+                 underlying_asset_tri: pd.DataFrame,
+                 target_volatility: float,
+                 volatility_lookback_years: int,
+                 rebalance_freq: str = 'D',
+                 skip_recent_month: bool = False, # <<< ADDED
+                 trading_days_per_year: int = 252,
+                 max_leverage: float = 2.0,
+                 min_leverage: float = 0.0,
+                 min_realized_vol_floor: float = 0.005):
+        """
+        Initializes the VolatilityTargetPortfolio object.
+
+        Args:
+            equal_vol_weights (pd.DataFrame): Daily EOD weights from base strategy.
+            underlying_asset_tri (pd.DataFrame): TRI for underlying assets.
+            target_volatility (float): Desired annualized volatility.
+            volatility_lookback_years (int): Lookback in years for realized vol.
+            rebalance_freq (str): Leverage rebalancing frequency. Defaults to 'D'.
+            skip_recent_month (bool): If True, excludes the most recent month
+                                      from realized volatility calculation.
+                                      Defaults to False. # <<< ADDED
+            trading_days_per_year (int): Trading days per year. Defaults to 252.
+            max_leverage (float): Maximum leverage. Defaults to 2.0.
+            min_leverage (float): Minimum leverage. Defaults to 0.0.
+            min_realized_vol_floor (float): Min vol floor. Defaults to 0.005.
+        """
+        self.equal_vol_weights = equal_vol_weights.copy()
+        self.underlying_asset_tri = underlying_asset_tri.copy()
+        self.target_volatility = target_volatility
+        self.volatility_lookback_years = volatility_lookback_years
+        self.rebalance_freq = rebalance_freq.upper()
+        self.skip_recent_month = skip_recent_month # <<< ADDED
+        self.trading_days_per_year = trading_days_per_year
+        self.max_leverage = max_leverage
+        self.min_leverage = min_leverage
+        self.min_realized_vol_floor = min_realized_vol_floor
+
+        self._validate_inputs()
+
+        try:
+            bt = Backtester(strategy_weights=self.equal_vol_weights,
+                            substrategy_total_return_index=self.underlying_asset_tri,
+                            trading_days_per_year=self.trading_days_per_year)
+            self.base_portfolio_daily_returns = bt.get_strategy_returns(frequency='daily')
+        except Exception as e:
+            raise ValueError(f"Error initializing Backtester: {e}")
+
+        if self.base_portfolio_daily_returns.empty:
+            raise ValueError("Base portfolio daily returns are empty.")
+
+        min_days_for_lookback = int(self.volatility_lookback_years * self.trading_days_per_year * 0.6)
+        if len(self.base_portfolio_daily_returns.dropna()) < min_days_for_lookback :
+            raise ValueError(f"Insufficient base portfolio return history for lookback.")
+
+    def _validate_inputs(self):
+        """Validates initialization parameters."""
+        # (Keep existing validations - add one for skip_recent_month if needed, though bool is usually fine)
+        if not isinstance(self.skip_recent_month, bool):
+             raise TypeError("skip_recent_month must be a boolean value.")
+        pass # Add other validations here if necessary
+
+    def _get_leverage_rebalance_dates(self) -> pd.DatetimeIndex:
+        """Determines the dates on which leverage should be recalculated."""
+        # (This method remains unchanged, as it only determines *when* to calculate,
+        # not *how* or *what data* to use for the calculation itself)
+        if self.base_portfolio_daily_returns.empty:
+            raise ValueError("Base portfolio daily returns not available.")
+
+        min_lookback_days = int(self.volatility_lookback_years * self.trading_days_per_year)
+        
+        # Adjust start date if skipping a month, as we need slightly more history.
+        effective_lookback_years = self.volatility_lookback_years
+        if self.skip_recent_month:
+             # Add approx 1/12th of a year in days if skipping a month
+             min_lookback_days += int(self.trading_days_per_year / 12)
+
+        if len(self.base_portfolio_daily_returns) < min_lookback_days:
+             raise ValueError(f"Not enough base portfolio return history ({len(self.base_portfolio_daily_returns)} days) "
+                              f"to cover the lookback period ({min_lookback_days} days).")
+        
+        first_possible_calc_end_date = self.base_portfolio_daily_returns.index[min_lookback_days - 1]
+        
+        eligible_calc_dates = self.base_portfolio_daily_returns.index[
+            self.base_portfolio_daily_returns.index >= first_possible_calc_end_date
+        ]
+        if eligible_calc_dates.empty:
+            raise ValueError(f"No eligible dates found for leverage calculation.")
+
+        start_date_for_range = eligible_calc_dates[0]
+        end_date_for_range = self.base_portfolio_daily_returns.index[-1]
+
+        if self.rebalance_freq == 'D':
+            rebalance_dates = eligible_calc_dates
+        else:
+            freq_map = {'W': 'W-FRI', 'M': 'ME', 'Q': 'QE', 'A': 'YE'}
+            pandas_freq = freq_map.get(self.rebalance_freq)
+            if pandas_freq is None:
+                raise ValueError(f"Unsupported rebalance frequency: {self.rebalance_freq}")
+
+            potential_eop_dates = pd.date_range(start=start_date_for_range,
+                                                end=end_date_for_range,
+                                                freq=pandas_freq)
+
+            actual_rebalance_dates = []
+            for eop_date in potential_eop_dates:
+                idx = eligible_calc_dates.searchsorted(eop_date, side='right')
+                if idx > 0:
+                    actual_date = eligible_calc_dates[idx - 1]
+                    if not actual_rebalance_dates or actual_date != actual_rebalance_dates[-1]:
+                         actual_rebalance_dates.append(actual_date)
+            
+            rebalance_dates = pd.DatetimeIndex(sorted(list(set(actual_rebalance_dates))))
+            rebalance_dates = rebalance_dates[rebalance_dates.isin(eligible_calc_dates)]
+
+        if rebalance_dates.empty:
+            raise ValueError(f"No rebalance dates could be determined.")
+        return rebalance_dates.sort_values()
+
+
+    def _calculate_realized_volatility(self, calculation_end_date: pd.Timestamp) -> float:
+        """
+        Calculates annualized realized volatility of the base portfolio.
+        Uses returns up to calculation_end_date, optionally skipping the last month.
+
+        Args:
+            calculation_end_date (pd.Timestamp): The *latest possible* end date for data.
+
+        Returns:
+            float: Annualized volatility, or np.nan if insufficient data.
+        """
+        vol_window_end = calculation_end_date
+
+        # --- MODIFICATION: Adjust end date if skipping recent month ---
+        if self.skip_recent_month:
+            target_end = calculation_end_date - pd.DateOffset(months=1)
+            # Find the closest trading day <= target_end
+            idx = self.base_portfolio_daily_returns.index.searchsorted(target_end, side='right')
+            if idx == 0:
+                 return np.nan # Not enough history to skip a month
+            vol_window_end = self.base_portfolio_daily_returns.index[idx - 1]
+        # --- END MODIFICATION ---
+
+        # Ensure the (potentially adjusted) end date is in the index
+        if vol_window_end not in self.base_portfolio_daily_returns.index:
+            idx = self.base_portfolio_daily_returns.index.searchsorted(vol_window_end, side='right')
+            if idx == 0: return np.nan 
+            actual_calc_end_date = self.base_portfolio_daily_returns.index[idx-1]
+        else:
+            actual_calc_end_date = vol_window_end
+
+        # Determine the start date based on the adjusted end date
+        target_start_date = actual_calc_end_date - pd.DateOffset(years=self.volatility_lookback_years) + BDay()
+
+        window_start_date_idx = self.base_portfolio_daily_returns.index.searchsorted(target_start_date, side='left')
+        window_start_date = self.base_portfolio_daily_returns.index[window_start_date_idx]
+        
+        # Use actual_calc_end_date for slicing
+        returns_window = self.base_portfolio_daily_returns.loc[window_start_date:actual_calc_end_date]
+        
+        min_required_days = max(30, int(self.trading_days_per_year * self.volatility_lookback_years * 0.60))
+        
+        if len(returns_window.dropna()) < min_required_days:
+            return np.nan
+
+        daily_std_dev = returns_window.std(ddof=1)
+        annualized_vol = daily_std_dev * np.sqrt(self.trading_days_per_year)
+        
+        return annualized_vol
+
+    def _calculate_leverage(self, calculation_end_date: pd.Timestamp) -> float:
+        """Calculates the target leverage for the portfolio."""
+        # (This method remains unchanged, it just calls the modified _calculate_realized_volatility)
+        realized_vol = self._calculate_realized_volatility(calculation_end_date)
+
+        if pd.isna(realized_vol):
+            return np.nan
+
+        adjusted_realized_vol = max(realized_vol, self.min_realized_vol_floor)
+        
+        if adjusted_realized_vol < 1e-9: 
+             leverage = self.max_leverage
+        else:
+            leverage = self.target_volatility / adjusted_realized_vol
+
+        clamped_leverage = max(self.min_leverage, min(self.max_leverage, leverage))
+        
+        return clamped_leverage
+
+    def construct_target_vol_weights(self) -> pd.DataFrame:
+        """Constructs the final portfolio weights."""
+        # (This method remains unchanged, as it just calls _calculate_leverage)
+        leverage_calc_dates = self._get_leverage_rebalance_dates()
+        if leverage_calc_dates.empty:
+            print("Warning: No leverage calculation dates found. Returning empty DataFrame.")
+            return pd.DataFrame(columns=self.equal_vol_weights.columns)
+
+        first_leverage_application_date = leverage_calc_dates[0] + BDay(1)
+        if first_leverage_application_date not in self.equal_vol_weights.index:
+            idx = self.equal_vol_weights.index.searchsorted(first_leverage_application_date, side='left')
+            if idx >= len(self.equal_vol_weights.index): 
+                 print("Warning: No EVW dates after first leverage date. Returning empty.")
+                 return pd.DataFrame(columns=self.equal_vol_weights.columns)
+            first_leverage_application_date = self.equal_vol_weights.index[idx]
+
+        effective_start_date = max(self.equal_vol_weights.index[0], first_leverage_application_date)
+        
+        output_dates_index = self.equal_vol_weights.index[
+            (self.equal_vol_weights.index >= effective_start_date)
+        ]
+
+        if output_dates_index.empty:
+            print("Warning: No output dates found. Returning empty DataFrame.")
+            return pd.DataFrame(columns=self.equal_vol_weights.columns)
+
+        target_vol_weights_df = pd.DataFrame(index=output_dates_index,
+                                             columns=self.equal_vol_weights.columns,
+                                             dtype=float)
+
+        active_leverage = np.nan
+        leverage_calc_dates_set = set(leverage_calc_dates)
+
+        for current_date in output_dates_index:
+            prev_calc_date_idx = self.base_portfolio_daily_returns.index.searchsorted(current_date, side='left') -1
+            if prev_calc_date_idx < 0: 
+                target_vol_weights_df.loc[current_date] = np.nan 
+                continue
+            prev_calc_date = self.base_portfolio_daily_returns.index[prev_calc_date_idx]
+
+            if pd.isna(active_leverage) or prev_calc_date in leverage_calc_dates_set:
+                if prev_calc_date in leverage_calc_dates_set:
+                     current_calculated_leverage = self._calculate_leverage(prev_calc_date)
+                     if not pd.isna(current_calculated_leverage): 
+                         active_leverage = current_calculated_leverage
+                     else: # If calc fails on rebalance day, set leverage to NaN
+                         active_leverage = np.nan
+
+            if pd.isna(active_leverage):
+                target_vol_weights_df.loc[current_date] = np.nan
+            else:
+                if current_date in self.equal_vol_weights.index:
+                    base_weights_for_day = self.equal_vol_weights.loc[current_date]
+                    target_vol_weights_df.loc[current_date] = base_weights_for_day * active_leverage
+                else:
+                    target_vol_weights_df.loc[current_date] = np.nan
+        
+        return target_vol_weights_df
