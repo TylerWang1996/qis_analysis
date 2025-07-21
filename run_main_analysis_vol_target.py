@@ -97,7 +97,6 @@ def aggregate_attribution_by_group(
         return pd.DataFrame()
 
     print("   - Aggregating currency attribution into custom groups...")
-    # Transpose so currencies are rows for easier summing
     detailed_attribution_df_T = detailed_attribution_df.transpose()
     
     grouped_summary = {}
@@ -109,9 +108,9 @@ def aggregate_attribution_by_group(
         if valid_ccys_in_group:
             grouped_summary[group_name] = detailed_attribution_df_T.loc[valid_ccys_in_group].sum(axis=0)
         else:
-            grouped_summary[group_name] = 0.0
+            # *** FIX: Instead of scalar 0.0, create a Series with the correct index ***
+            grouped_summary[group_name] = pd.Series(0.0, index=detailed_attribution_df_T.columns)
 
-    # Handle 'EM - Other'
     other_em_ccys = []
     for ccy, classification in currency_classification_map.items():
         ccy_upper = ccy.upper()
@@ -123,12 +122,11 @@ def aggregate_attribution_by_group(
     if other_em_ccys:
         grouped_summary['EM - Other'] = detailed_attribution_df_T.loc[other_em_ccys].sum(axis=0)
     else:
-        grouped_summary['EM - Other'] = 0.0
+        # *** FIX: Also apply the fix here for consistency ***
+        grouped_summary['EM - Other'] = pd.Series(0.0, index=detailed_attribution_df_T.columns)
         
     final_df = pd.DataFrame(grouped_summary).transpose()
-    # Add a total row for verification
     if not final_df.empty:
-        # Calculate total based on the sum of the groups, not the original 'Total'
         final_df.loc['Total', :] = final_df.sum(axis=0)
         
     return final_df
@@ -149,13 +147,12 @@ def aggregate_exposure_by_group(
 
     for group_name, currency_list in currency_groups.items():
         currency_list_upper = [c.upper() for c in currency_list]
-        valid_ccys_in_group = [c.upper() for c in currency_list_upper if c.upper() in detailed_exposure_ts.columns]
+        valid_ccys_in_group = [c for c in currency_list_upper if c.upper() in detailed_exposure_ts.columns]
         if valid_ccys_in_group:
             grouped_exposures_df[group_name] = detailed_exposure_ts[valid_ccys_in_group].sum(axis=1)
         else:
             grouped_exposures_df[group_name] = 0.0
 
-    # Handle 'EM - Other'
     other_em_ccys = []
     for ccy, classification in currency_classification_map.items():
         ccy_upper = ccy.upper()
