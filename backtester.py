@@ -50,6 +50,8 @@ class Backtester:
         # Calculate substrategy daily returns
         self._substrat_returns = self._substrat_tri.pct_change()
 
+        self.daily_contributions = self._calculate_daily_contributions()
+
         # Align data and calculate strategy daily returns
         self.strategy_daily_returns = self._calculate_strategy_returns()
 
@@ -65,6 +67,23 @@ class Backtester:
              # It's possible the first/last month has issues if daily data is sparse there
              # self.strategy_monthly_returns = self.strategy_monthly_returns.dropna()
 
+    def _calculate_daily_contributions(self) -> pd.DataFrame:
+        """
+        Calculates the daily arithmetic contribution of each substrategy.
+        Contribution = Weight(t-1) * Return(t)
+        """
+        weights_aligned, returns_aligned = self._strategy_weights.align(
+            self._substrat_returns, join='inner', axis=1
+        )
+        shifted_weights = weights_aligned.shift(1)
+        
+        # Align again after shifting to ensure dates match perfectly
+        shifted_weights, returns_aligned = shifted_weights.align(returns_aligned, join='inner', axis=0)
+        
+        # Element-wise multiplication
+        daily_contrib = shifted_weights * returns_aligned
+        
+        return daily_contrib.dropna(how='all') # Drop rows that are all NaN (e.g., first day)
 
     def _calculate_strategy_returns(self) -> pd.Series:
         """
