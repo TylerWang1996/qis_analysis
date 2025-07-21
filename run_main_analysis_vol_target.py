@@ -64,11 +64,112 @@ CURRENCY_CLASSIFICATION_MAP: Dict[str, str] = {
     'SGD': 'EM', 'THB': 'EM', 'TRY': 'EM', 'TWD': 'EM', 'ZAR': 'EM'
 }
 
+# --- NEW: Currency Grouping Definition ---
+CURRENCY_GROUPS: Dict[str, List[str]] = {
+    'USD': ['USD'],
+    'CAD': ['CAD'],
+    'JPY': ['JPY'],
+    'European Majors': ['EUR', 'GBP', 'CHF'],
+    'Scandinavians': ['SEK', 'NOK'],
+    'Antipodeans': ['AUD', 'NZD'],
+    'EM - EMEA': ['CZK', 'HUF', 'ILS', 'PLN', 'RON', 'RUB', 'TRY', 'ZAR'],
+    'EM - LATAM': ['BRL', 'CLP', 'COP', 'MXN', 'PEN'],
+    'EM - Asia': ['CNY', 'IDR', 'INR', 'KRW', 'MYR', 'PHP', 'SGD', 'THB', 'TWD']
+}
+
 # 5. Analysis Periods
 ANALYSIS_PERIODS: Optional[Dict[str, Union[str, Tuple[Optional[str], Optional[str]]]]] = {
     'Full Sample': None, 'Last 1Y': '1Y', 'Last 3Y': '3Y',
     'Last 5Y': '5Y', 'Last 10Y': '10Y'
 }
+
+# ==============================================================================
+# --- NEW HELPER FUNCTIONS FOR AGGREGATION ---
+# ==============================================================================
+
+def aggregate_attribution_by_group(
+    detailed_attribution_df: pd.DataFrame,
+    currency_groups: Dict[str, List[str]],
+    currency_classification_map: Dict[str, str]
+    ) -> pd.DataFrame:
+    """Aggregates a detailed currency attribution summary into custom groups."""
+    if detailed_attribution_df.empty:
+        return pd.DataFrame()
+
+    print("   - Aggregating currency attribution into custom groups...")
+    # Transpose so currencies are rows for easier summing
+    detailed_attribution_df_T = detailed_attribution_df.transpose()
+    
+    grouped_summary = {}
+    all_grouped_ccys = set(c.upper() for grp in currency_groups.values() for c in grp)
+
+    for group_name, currency_list in currency_groups.items():
+        currency_list_upper = [c.upper() for c in currency_list]
+        valid_ccys_in_group = [c for c in currency_list_upper if c in detailed_attribution_df_T.index]
+        if valid_ccys_in_group:
+            grouped_summary[group_name] = detailed_attribution_df_T.loc[valid_ccys_in_group].sum(axis=0)
+        else:
+            grouped_summary[group_name] = 0.0
+
+    # Handle 'EM - Other'
+    other_em_ccys = []
+    for ccy, classification in currency_classification_map.items():
+        ccy_upper = ccy.upper()
+        if (classification.upper() == 'EM' and 
+            ccy_upper not in all_grouped_ccys and 
+            ccy_upper in detailed_attribution_df_T.index):
+            other_em_ccys.append(ccy_upper)
+            
+    if other_em_ccys:
+        grouped_summary['EM - Other'] = detailed_attribution_df_T.loc[other_em_ccys].sum(axis=0)
+    else:
+        grouped_summary['EM - Other'] = 0.0
+        
+    final_df = pd.DataFrame(grouped_summary).transpose()
+    # Add a total row for verification
+    if not final_df.empty:
+        # Calculate total based on the sum of the groups, not the original 'Total'
+        final_df.loc['Total', :] = final_df.sum(axis=0)
+        
+    return final_df
+
+
+def aggregate_exposure_by_group(
+    detailed_exposure_ts: pd.DataFrame,
+    currency_groups: Dict[str, List[str]],
+    currency_classification_map: Dict[str, str]
+    ) -> pd.DataFrame:
+    """Aggregates a detailed currency exposure time series into custom groups."""
+    if detailed_exposure_ts.empty:
+        return pd.DataFrame()
+
+    print("   - Aggregating currency exposure into custom groups...")
+    grouped_exposures_df = pd.DataFrame(index=detailed_exposure_ts.index)
+    all_grouped_ccys = set(c.upper() for grp in currency_groups.values() for c in grp)
+
+    for group_name, currency_list in currency_groups.items():
+        currency_list_upper = [c.upper() for c in currency_list]
+        valid_ccys_in_group = [c.upper() for c in currency_list_upper if c.upper() in detailed_exposure_ts.columns]
+        if valid_ccys_in_group:
+            grouped_exposures_df[group_name] = detailed_exposure_ts[valid_ccys_in_group].sum(axis=1)
+        else:
+            grouped_exposures_df[group_name] = 0.0
+
+    # Handle 'EM - Other'
+    other_em_ccys = []
+    for ccy, classification in currency_classification_map.items():
+        ccy_upper = ccy.upper()
+        if (classification.upper() == 'EM' and 
+            ccy_upper not in all_grouped_ccys and 
+            ccy_upper in detailed_exposure_ts.columns):
+            other_em_ccys.append(ccy_upper)
+            
+    if other_em_ccys:
+        grouped_exposures_df['EM - Other'] = detailed_exposure_ts[other_em_ccys].sum(axis=1)
+    else:
+        grouped_exposures_df['EM - Other'] = 0.0
+        
+    return grouped_exposures_df
 
 # ==============================================================================
 # --- Main Analysis Workflow ---
@@ -184,6 +285,13 @@ def run_analysis():
     except Exception as e:
         print(f"Error during backtesting: {e}")
         traceback.print_exc()
+        
+        # <<< NEW: Calculate contribution summary >>>
+        print("   - Calculating substrategy contribution summary...")
+        substrat_contribution_summary = backtester.calculate_contribution_summary(
+            periods=ANALYSIS_PERIODS
+        )
+        # <<< END NEW >>>
 
     # --- Step 3: Correlation Analysis ---
     print("\n--- Running Correlation Analysis ---")
@@ -231,9 +339,20 @@ def run_analysis():
                 substrat_weight_files_map=CURRENCY_WEIGHT_FILES_MAP
             )
             currency_exposure_ts = exposure_calculator.calculate_exposures()
-            print("Currency exposure calculation complete.")
+            # --- NEW: Call helper functions to aggregate the results ---
+            if attr_results and 'Currency' in attr_results:
+                # Use the detailed 'Currency' attribution summary as input
+                detailed_currency_attribution = attr_results['Currency']
+                grouped_attr_summary = aggregate_attribution_by_group(
+                    detailed_currency_attribution, CURRENCY_GROUPS, CURRENCY_CLASSIFICATION_MAP
+                )
+            if currency_exposure_ts is not None:
+                grouped_exposure_ts = aggregate_exposure_by_group(
+                    currency_exposure_ts, CURRENCY_GROUPS, CURRENCY_CLASSIFICATION_MAP
+                )
+            print("Attribution & Exposure calculations complete.")
         except Exception as e:
-            print(f"Error during currency exposure calculation: {e}")
+            print(f"Error during attribution/exposure: {e}")
             traceback.print_exc()
     else:
         print("\n--- Skipping Currency Exposure (no files provided) ---")
@@ -255,6 +374,33 @@ def run_analysis():
                 print("- Writing Backtest TRI sheet...")
             else: print("- Skipping Backtest TRI.")
             
+            # <<< NEW: Write Contribution Summary to a new sheet >>>
+            if substrat_contribution_summary is not None:
+                substrat_contribution_summary.to_excel(writer, sheet_name='Substrat Contribution', index=True)
+                print("- Writing Substrat Contribution sheet...")
+            else:
+                print("- Skipping Substrat Contribution.")
+            # <<< END NEW >>>
+            
+            # --- Writing Detailed Attribution and Exposure ---
+            if attr_results:
+                 for key, df in attr_results.items():
+                      if not df.empty:
+                          df.to_excel(writer, sheet_name=f"Detailed {key} Attribution")
+                 print("- Writing detailed Attribution sheets...")
+            if currency_exposure_ts is not None:
+                 currency_exposure_ts.to_excel(writer, sheet_name='Detailed Ccy Exposure')
+                 print("- Writing Detailed Ccy Exposure sheet...")
+            
+            # --- NEW: Write Grouped Summaries to new sheets ---
+            if grouped_attr_summary is not None:
+                grouped_attr_summary.to_excel(writer, sheet_name='Grouped Ccy Attribution')
+                print("- Writing Grouped Ccy Attribution sheet...")
+            if grouped_exposure_ts is not None:
+                grouped_exposure_ts.to_excel(writer, sheet_name='Grouped Ccy Exposure')
+                print("- Writing Grouped Ccy Exposure sheet...")
+            # --- END NEW ---
+                        
             # (Add writing logic for Correlation, Attribution, Exposure as before)
             # Example for Correlation:
             start_row_corr = 0

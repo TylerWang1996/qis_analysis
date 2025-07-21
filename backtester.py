@@ -491,5 +491,82 @@ class Backtester:
         """
         return self.calculate_performance_summary(periods=periods, frequency='monthly')
 
+    def calculate_contribution_summary(self,
+        periods: Optional[Dict[str, Union[str, Tuple[Optional[str], Optional[str]]]]] = None
+        ) -> pd.DataFrame:
+        """
+        Calculates the total arithmetic contribution of each substrategy over specified periods.
+
+        Args:
+            periods (dict, optional): Dictionary defining periods. See calculate_performance_summary.
+
+        Returns:
+            pd.DataFrame: DataFrame with substrategies as rows and periods as columns,
+                          showing total contribution.
+        """
+        if self.daily_contributions.empty:
+            print("Warning: Daily contributions data is empty. Cannot calculate summary.")
+            return pd.DataFrame()
+
+        if periods is None:
+            periods = {
+                'Full Sample': None, 'Last 1Y': '1Y', 'Last 3Y': '3Y', 'Last 5Y': '5Y'
+            }
+        
+        all_contributions = {}
+        base_end_date = self.daily_contributions.index[-1]
+
+        for name, period_def in periods.items():
+            start_dt = None
+            end_dt = base_end_date
+
+            try:
+                if period_def is None: # Full Sample
+                    start_dt = self.daily_contributions.index[0]
+                elif isinstance(period_def, str): # Relative 'XY' or 'XM'
+                    num = int(period_def[:-1])
+                    unit = period_def[-1].upper()
+                    if unit == 'Y': offset = pd.DateOffset(years=num)
+                    elif unit == 'M': offset = pd.DateOffset(months=num)
+                    else: raise ValueError(f"Invalid relative period unit: {unit}. Use 'Y' or 'M'.")
+                    
+                    start_dt_target = base_end_date - offset
+                    available_dates = self.daily_contributions.index[self.daily_contributions.index >= start_dt_target]
+                    start_dt = available_dates[0] if not available_dates.empty else None
+
+                elif isinstance(period_def, tuple): # Date range
+                    start_str, end_str = period_def
+                    if start_str:
+                        start_dt_target = pd.to_datetime(start_str)
+                        available_dates = self.daily_contributions.index[self.daily_contributions.index >= start_dt_target]
+                        start_dt = available_dates[0] if not available_dates.empty else None
+                    else:
+                        start_dt = self.daily_contributions.index[0]
+
+                    if end_str:
+                        end_dt_target = pd.to_datetime(end_str)
+                        available_dates = self.daily_contributions.index[self.daily_contributions.index <= end_dt_target]
+                        end_dt = available_dates[-1] if not available_dates.empty else None
+                
+                # Slice and sum contributions for the period
+                if start_dt is not None and end_dt is not None and start_dt <= end_dt:
+                    period_contributions = self.daily_contributions.loc[start_dt:end_dt]
+                    all_contributions[name] = period_contributions.sum()
+                else:
+                    # If period is invalid, fill with NaNs
+                    all_contributions[name] = pd.Series(np.nan, index=self.daily_contributions.columns)
+
+            except Exception as e:
+                print(f"\nError calculating contribution for period '{name}': {e}")
+                all_contributions[name] = pd.Series(np.nan, index=self.daily_contributions.columns)
+
+        # Format results into a DataFrame
+        summary_df = pd.DataFrame(all_contributions)
+        
+        # Add a 'Total' row to verify it sums to the portfolio's arithmetic return
+        if not summary_df.empty:
+            summary_df.loc['Total Portfolio Return'] = summary_df.sum(axis=0)
+
+        return summary_df
 
 # Note: The __main__ block has been removed and placed in the testing file.
