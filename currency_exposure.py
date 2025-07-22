@@ -148,6 +148,7 @@ class CurrencyExposureCalculator:
         # Load and prepare all substrat weights aligned to these daily dates
         try:
             daily_substrat_weights_map = self._load_and_prepare_substrat_weights(common_dates)
+            self.daily_substrat_weights_map = daily_substrat_weights_map
         except (FileNotFoundError, ValueError, RuntimeError) as e:
              print(f"Error preparing substrategy weights: {e}")
              # Return empty DataFrame or re-raise depending on desired handling

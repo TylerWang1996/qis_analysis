@@ -168,6 +168,61 @@ def aggregate_exposure_by_group(
         
     return grouped_exposures_df
 
+
+def calculate_netting_efficiency(
+    final_exposures: pd.DataFrame,
+    top_level_weights: pd.DataFrame,
+    daily_substrat_weights_map: Dict[str, pd.DataFrame]
+    ) -> Optional[pd.DataFrame]:
+    """
+    Calculates the netting efficiency by comparing the final gross exposure
+    to the theoretical pre-netting gross exposure.
+
+    Args:
+        final_exposures (pd.DataFrame): The final net currency exposures of the top-level portfolio.
+        top_level_weights (pd.DataFrame): The daily weights allocated to each substrategy.
+        daily_substrat_weights_map (Dict[str, pd.DataFrame]): A map of substrat tickers
+                                                              to their daily currency weights DataFrame.
+
+    Returns:
+        pd.DataFrame: A daily time series of pre-netting, post-netting, and ratio values.
+    """
+    print("   - Calculating Netting Efficiency Ratio...")
+    if final_exposures.empty:
+        return None
+
+    # Numerator: Calculate the gross exposure of the final, netted portfolio
+    post_netting_gross = final_exposures.abs().sum(axis=1)
+    post_netting_gross.name = 'Post-Netting Gross Exposure'
+
+    # Denominator: Calculate the theoretical gross exposure before any netting
+    # Align indices for calculation
+    common_index = final_exposures.index
+    pre_netting_gross = pd.Series(0.0, index=common_index)
+    shifted_top_weights = top_level_weights.shift(1) # Use t-1 weights
+
+    for ticker, substrat_df in daily_substrat_weights_map.items():
+        if ticker in shifted_top_weights.columns:
+            # Gross exposure of the individual substrategy
+            substrat_gross = substrat_df.abs().sum(axis=1)
+            # Weight for this substrat
+            top_weight = shifted_top_weights[ticker]
+            # Align and calculate the weighted gross exposure contribution
+            aligned_gross, aligned_weight = substrat_gross.align(top_weight, join='right', fill_value=0)
+            pre_netting_gross = pre_netting_gross.add(aligned_gross * aligned_weight, fill_value=0)
+
+    pre_netting_gross.name = 'Pre-Netting Gross Exposure'
+    pre_netting_gross = pre_netting_gross.loc[common_index] # Ensure index matches
+
+    # Calculate the ratio, handling division by zero
+    ratio = (post_netting_gross / pre_netting_gross).fillna(0.0)
+    ratio.name = 'Netting Efficiency Ratio'
+
+    # Combine into a single DataFrame for output
+    result_df = pd.concat([post_netting_gross, pre_netting_gross, ratio], axis=1)
+
+    return result_df
+
 # ==============================================================================
 # --- Main Analysis Workflow ---
 # ==============================================================================
@@ -347,6 +402,11 @@ def run_analysis():
                 grouped_exposure_ts = aggregate_exposure_by_group(
                     currency_exposure_ts, CURRENCY_GROUPS, CURRENCY_CLASSIFICATION_MAP
                 )
+            if currency_exposure_ts is not None and hasattr(exposure_calculator, 'daily_substrat_weights_map'):
+                netting_efficiency_df = calculate_netting_efficiency(
+                final_exposures=currency_exposure_ts,
+                top_level_weights=exposure_calculator.top_level_weights,
+                daily_substrat_weights_map=exposure_calculator.daily_substrat_weights_map)
             print("Attribution & Exposure calculations complete.")
         except Exception as e:
             print(f"Error during attribution/exposure: {e}")
@@ -396,6 +456,12 @@ def run_analysis():
             if grouped_exposure_ts is not None:
                 grouped_exposure_ts.to_excel(writer, sheet_name='Grouped Ccy Exposure')
                 print("- Writing Grouped Ccy Exposure sheet...")
+                
+            if netting_efficiency_df is not None:
+                netting_efficiency_df.to_excel(writer, sheet_name='Netting Efficiency')
+                print("- Writing Netting Efficiency sheet...")
+            else:
+                print("- Skipping Netting Efficiency.")
             # --- END NEW ---
                         
             # (Add writing logic for Correlation, Attribution, Exposure as before)
